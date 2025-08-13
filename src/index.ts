@@ -1,10 +1,13 @@
 import * as net from 'net';
+import * as http from 'http';
 import { logger, createServiceLogger } from './common/logger';
 import { config } from './config';
 import { MatchmakerService } from './services/matchmaker/service';
 import { ApiGatewayService } from './services/api-gateway/service';
 import { SessionService } from './services/session/service';
 import { HealthMonitorService } from './services/health-monitor/service';
+import { WebSocketService } from './services/websocket/service';
+import { AdminDashboardService } from './services/admin-dashboard/service';
 import { MatchmakerMessage } from './types';
 
 class EnhancedMatchmaker {
@@ -13,7 +16,10 @@ class EnhancedMatchmaker {
   private apiGatewayService: ApiGatewayService;
   private sessionService: SessionService;
   private healthMonitorService: HealthMonitorService;
+  private webSocketService!: WebSocketService;
+  private adminDashboardService!: AdminDashboardService;
   private tcpServer!: net.Server;
+  private httpServer!: http.Server;
   private connectionMap = new Map<net.Socket, string>(); // connection -> serverId
 
   constructor() {
@@ -38,8 +44,29 @@ class EnhancedMatchmaker {
     try {
       this.logger.info('Starting Enhanced Matchmaker services');
 
-      // Start API Gateway
-      await this.apiGatewayService.start(config.HttpPort);
+      // Create HTTP server for Express and Socket.IO
+      this.httpServer = http.createServer(this.apiGatewayService.getApp());
+
+      // Initialize WebSocket service
+      this.webSocketService = new WebSocketService(
+        this.httpServer,
+        this.matchmakerService,
+        this.sessionService
+      );
+
+      // Initialize Admin Dashboard
+      this.adminDashboardService = new AdminDashboardService(
+        this.matchmakerService,
+        this.sessionService,
+        this.healthMonitorService,
+        this.webSocketService
+      );
+
+      // Start HTTP server with Express and Socket.IO
+      await this.startHttpServer();
+
+      // Start Admin Dashboard
+      await this.adminDashboardService.start(config.AdminDashboardPort!);
 
       // Start TCP server for Cirrus connections
       await this.startTcpServer();
@@ -47,6 +74,7 @@ class EnhancedMatchmaker {
       this.logger.info('Enhanced Matchmaker started successfully', {
         httpPort: config.HttpPort,
         matchmakerPort: config.MatchmakerPort,
+        adminDashboardPort: config.AdminDashboardPort,
         useHttps: config.UseHTTPS,
       });
 
@@ -54,7 +82,12 @@ class EnhancedMatchmaker {
       setTimeout(() => {
         const stats = this.matchmakerService.getStats();
         const health = this.healthMonitorService.getOverallHealth();
-        this.logger.info('System status after startup', { stats, health: health.status });
+        const wsClients = this.webSocketService.getConnectedClientsCount();
+        this.logger.info('System status after startup', { 
+          stats, 
+          health: health.status,
+          webSocketClients: wsClients,
+        });
       }, 5000);
 
     } catch (error: any) {
@@ -108,6 +141,24 @@ class EnhancedMatchmaker {
         },
       };
     });
+
+    // WebSocket service health check (when initialized)
+    setTimeout(() => {
+      if (this.webSocketService) {
+        this.healthMonitorService.registerService('webSocket', async () => {
+          const connectedClients = this.webSocketService.getConnectedClientsCount();
+          
+          return {
+            service: 'webSocket',
+            status: 'healthy',
+            lastCheck: Date.now(),
+            details: {
+              connectedClients,
+            },
+          };
+        });
+      }
+    }, 1000);
   }
 
   /**
@@ -177,6 +228,20 @@ class EnhancedMatchmaker {
 
     this.tcpServer.on('error', (error) => {
       this.logger.error('TCP server error', { error: error.message });
+    });
+  }
+
+  /**
+   * Start HTTP server for Express and Socket.IO
+   */
+  private startHttpServer(): Promise<void> {
+    return new Promise((resolve) => {
+      this.httpServer.listen(config.HttpPort, () => {
+        this.logger.info('HTTP server started with Express and Socket.IO', { 
+          port: config.HttpPort 
+        });
+        resolve();
+      });
     });
   }
 
@@ -280,8 +345,12 @@ class EnhancedMatchmaker {
       try {
         // Stop accepting new connections
         this.tcpServer?.close();
+        this.httpServer?.close();
 
         // Shutdown services
+        if (this.webSocketService) {
+          await this.webSocketService.shutdown();
+        }
         await this.sessionService.shutdown();
         await this.healthMonitorService.shutdown();
 
@@ -306,6 +375,7 @@ async function main(): Promise<void> {
       config: {
         httpPort: config.HttpPort,
         matchmakerPort: config.MatchmakerPort,
+        adminDashboardPort: config.AdminDashboardPort,
         useHttps: config.UseHTTPS,
       },
     });
